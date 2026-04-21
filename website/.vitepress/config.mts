@@ -11,6 +11,7 @@ function normalizeBase(base?: string): string {
 
 const docsBase = normalizeBase(process.env.DOCS_BASE || '/')
 const editBranch = process.env.DOCS_EDIT_BRANCH || 'main'
+const gaId = process.env.MEMPALACE_DOCS_GA_ID
 
 export default withMermaid(
   defineConfig({
@@ -26,8 +27,10 @@ export default withMermaid(
       ['meta', { property: 'og:title', content: 'MemPalace — AI Memory System' }],
       ['meta', { property: 'og:description', content: '96.6% LongMemEval recall. Zero API calls. Local, free, open source.' }],
       ['meta', { property: 'og:image', content: `${docsBase}mempalace_logo.png` }],
-      ['script', { async: '', src: 'https://www.googletagmanager.com/gtag/js?id=G-PPQE4Z7P1K' }],
-      ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', 'G-PPQE4Z7P1K');`],
+      ...(gaId ? [
+        ['script', { async: '', src: `https://www.googletagmanager.com/gtag/js?id=${gaId}` }],
+        ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', '${gaId}');`],
+      ] as const : []),
     ],
 
     themeConfig: {
