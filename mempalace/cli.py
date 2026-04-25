@@ -71,7 +71,8 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
 def cmd_init(args):
     import json
     from pathlib import Path
-    from .entity_detector import scan_for_detection, detect_entities, confirm_entities
+    from .entity_detector import confirm_entities
+    from .project_scanner import discover_entities
     from .room_detector_local import detect_rooms_local
 
     cfg = MempalaceConfig()
@@ -85,25 +86,68 @@ def cmd_init(args):
         languages = cfg.entity_languages
     languages_tuple = tuple(languages)
 
-    # Pass 1: auto-detect people and projects from file content
+    # Optional phase-2 LLM provider (opt-in via --llm).
+    llm_provider = None
+    if getattr(args, "llm", False):
+        from .llm_client import LLMError, get_provider
+
+        try:
+            llm_provider = get_provider(
+                name=args.llm_provider,
+                model=args.llm_model,
+                endpoint=args.llm_endpoint,
+                api_key=args.llm_api_key,
+            )
+        except LLMError as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+        ok, msg = llm_provider.check_available()
+        if not ok:
+            print(
+                f"  ERROR: LLM provider '{args.llm_provider}' unavailable: {msg}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"  LLM refinement enabled: {args.llm_provider}/{args.llm_model}")
+
+    # Pass 1: discover entities — manifests + git authors first, prose detection
+    # as supplement for names mentioned only in docs/notes. Optional phase-2
+    # LLM refinement runs inside discover_entities when llm_provider is given.
     print(f"\n  Scanning for entities in: {args.dir}")
     if languages_tuple != ("en",):
         print(f"  Languages: {', '.join(languages_tuple)}")
-    files = scan_for_detection(args.dir)
-    if files:
-        print(f"  Reading {len(files)} files...")
-        detected = detect_entities(files, languages=languages_tuple)
-        total = len(detected["people"]) + len(detected["projects"]) + len(detected["uncertain"])
-        if total > 0:
-            confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
-            # Save confirmed entities to <project>/entities.json for the miner
-            if confirmed["people"] or confirmed["projects"]:
-                entities_path = Path(args.dir).expanduser().resolve() / "entities.json"
-                with open(entities_path, "w") as f:
-                    json.dump(confirmed, f, indent=2)
-                print(f"  Entities saved: {entities_path}")
-        else:
-            print("  No entities detected — proceeding with directory-based rooms.")
+    detected = discover_entities(args.dir, languages=languages_tuple, llm_provider=llm_provider)
+    total = (
+        len(detected["people"])
+        + len(detected["projects"])
+        + len(detected.get("topics", []))
+        + len(detected["uncertain"])
+    )
+    if total > 0:
+        confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
+        # Save confirmed entities to <project>/entities.json (per-project
+        # audit trail — user can inspect or hand-edit) AND merge into the
+        # global registry the miner reads at mine time. Topics are kept
+        # separately so the miner can later compute cross-wing tunnels
+        # from shared topics (see palace_graph.compute_topic_tunnels).
+        if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
+            project_path = Path(args.dir).expanduser().resolve()
+            entities_path = project_path / "entities.json"
+            with open(entities_path, "w", encoding="utf-8") as f:
+                json.dump(confirmed, f, indent=2, ensure_ascii=False)
+            print(f"  Entities saved: {entities_path}")
+
+            from .miner import add_to_known_entities
+
+            # Wing matches the default produced by ``room_detector_local``
+            # (folder basename) and the miner fallback in ``load_config``.
+            # Used by the topics_by_wing map so cross-wing tunnels can be
+            # computed at mine time.
+            wing = project_path.name
+            registry_path = add_to_known_entities(confirmed, wing=wing)
+            print(f"  Registry updated: {registry_path}")
+    else:
+        print("  No entities detected — proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
@@ -111,6 +155,107 @@ def cmd_init(args):
 
     # Pass 3: protect git repos from accidentally committing per-project files
     _ensure_mempalace_files_gitignored(args.dir)
+
+    # Pass 4: offer to run mine immediately. The directory just had its
+    # rooms + entities set up, so 99% of users will mine next anyway —
+    # asking here removes the "remember to type the next command" friction.
+    # `--auto-mine` skips the prompt and mines automatically; `--yes` is
+    # SCOPED to entity auto-accept and does NOT imply mining.
+    _maybe_run_mine_after_init(args, cfg)
+
+
+def _format_size_mb(num_bytes: int) -> str:
+    """Render a byte count as a human-readable size for the mine estimate.
+
+    < 1 MB rounds up to ``<1 MB`` so users never see a misleading ``0 MB``
+    on small projects. Otherwise reports an integer megabyte count.
+    """
+    if num_bytes <= 0:
+        return "<1 MB"
+    mb = num_bytes / (1024 * 1024)
+    if mb < 1:
+        return "<1 MB"
+    return f"{mb:.0f} MB"
+
+
+def _maybe_run_mine_after_init(args, cfg) -> None:
+    """Prompt the user to mine the directory just initialised, or auto-mine
+    when ``--auto-mine`` was passed. Extracted so the prompt path is
+    unit-testable.
+
+    Behaviour matrix:
+
+    - default (no flags) — prompt, default Yes, mine in-process if accepted
+    - ``--yes`` — entity auto-accept only; STILL prompts for the mine step
+    - ``--auto-mine`` — skip the mine prompt and mine directly
+    - ``--yes --auto-mine`` — fully non-interactive
+
+    Mine errors are surfaced (not swallowed): a failing mine exits with a
+    non-zero status via :func:`sys.exit` so downstream scripts can see it.
+    The pre-scan that produces the file-count estimate is reused as the
+    mine input so we never walk the corpus twice.
+    """
+    from .miner import mine, scan_project
+
+    project_dir = args.dir
+    auto_mine = bool(getattr(args, "auto_mine", False))
+
+    # Single corpus walk: this scan feeds BOTH the "what would be mined"
+    # estimate the user sees in the prompt AND the file list mine() will
+    # process. We pass the result into mine() via the `files` kwarg so it
+    # doesn't re-walk the tree.
+    try:
+        scanned_files = scan_project(project_dir)
+        file_count = len(scanned_files)
+        total_bytes = 0
+        for fp in scanned_files:
+            try:
+                total_bytes += fp.stat().st_size
+            except OSError:
+                # Skip files that vanished between scan and stat — mine()
+                # will skip them too.
+                continue
+        size_str = _format_size_mb(total_bytes)
+    except Exception:
+        scanned_files = None
+        file_count = None
+        size_str = None
+
+    # Show the scope estimate BEFORE the prompt so the user knows what
+    # they are agreeing to. On a real corpus mine takes minutes; hitting
+    # Enter on a default-Y prompt with no size cue is a footgun.
+    if isinstance(file_count, int):
+        if size_str:
+            print(f"  ~{file_count} files (~{size_str}) would be mined into this palace.\n")
+        else:
+            print(f"  ~{file_count} files would be mined into this palace.\n")
+
+    if not auto_mine:
+        try:
+            answer = input("  Mine this directory now? [Y/n] ").strip().lower()
+        except EOFError:
+            # Non-interactive stdin (e.g. piped) — treat like decline so
+            # we don't block. User can re-run with --auto-mine to opt in.
+            answer = "n"
+        if answer not in ("", "y", "yes"):
+            print(f"\n  Skipped. Run `mempalace mine {shlex.quote(project_dir)}` when ready.")
+            return
+
+    palace_path = cfg.palace_path
+    try:
+        mine(
+            project_dir=project_dir,
+            palace_path=palace_path,
+            files=scanned_files,
+        )
+    except KeyboardInterrupt:
+        # mine() handles its own SIGINT summary + sys.exit(130); re-raise
+        # any KeyboardInterrupt that escapes (shouldn't happen) so the
+        # shell still sees a clean interrupt rather than a swallowed one.
+        raise
+    except Exception as e:
+        print(f"\n  ERROR: mine failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_mine(args):
@@ -542,6 +687,14 @@ def main():
         help="Auto-accept all detected entities (non-interactive)",
     )
     p_init.add_argument(
+        "--auto-mine",
+        action="store_true",
+        help=(
+            "Skip the post-init mine prompt and run mine automatically. "
+            "Combine with --yes for a fully non-interactive setup."
+        ),
+    )
+    p_init.add_argument(
         "--lang",
         default=None,
         help=(
@@ -549,6 +702,43 @@ def main():
             "(e.g. 'en' or 'en,pt-br'). Defaults to value from config "
             "(MEMPALACE_ENTITY_LANGUAGES env var or config.json), or 'en'. "
             "When given, the value is also persisted to config.json."
+        ),
+    )
+    p_init.add_argument(
+        "--llm",
+        action="store_true",
+        help=(
+            "Enable LLM-assisted entity refinement (opt-in, local-first). "
+            "Runs after manifest/git/regex detection, asking the configured "
+            "provider to reclassify ambiguous candidates. "
+            "Ctrl-C during refinement returns partial results."
+        ),
+    )
+    p_init.add_argument(
+        "--llm-provider",
+        default="ollama",
+        choices=["ollama", "openai-compat", "anthropic"],
+        help="LLM provider (default: ollama). Use --llm to enable.",
+    )
+    p_init.add_argument(
+        "--llm-model",
+        default="gemma4:e4b",
+        help="Model name for the chosen provider (default: gemma4:e4b for Ollama).",
+    )
+    p_init.add_argument(
+        "--llm-endpoint",
+        default=None,
+        help=(
+            "Provider endpoint URL. Default for Ollama: http://localhost:11434. "
+            "Required for openai-compat."
+        ),
+    )
+    p_init.add_argument(
+        "--llm-api-key",
+        default=None,
+        help=(
+            "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
+            "for openai-compat, defaults to $OPENAI_API_KEY."
         ),
     )
 

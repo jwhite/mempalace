@@ -57,7 +57,7 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
-from .backends.chroma import ChromaBackend, ChromaCollection  # noqa: E402
+from .backends.chroma import ChromaBackend, ChromaCollection, _pin_hnsw_threads  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -217,15 +217,25 @@ def _get_collection(create=False):
     try:
         client = _get_client()
         if create:
-            _collection_cache = ChromaCollection(
-                client.get_or_create_collection(
-                    _config.collection_name, metadata={"hnsw:space": "cosine"}
-                )
+            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
+            # HNSW insert path, which has a race in repairConnectionsForUpdate /
+            # addPoint (see issues #974, #965). Set via metadata on fresh
+            # collections and re-applied via _pin_hnsw_threads() for legacy
+            # palaces whose collections were created before this fix (the
+            # runtime config does not persist cross-process in chromadb 1.5.x,
+            # so the retrofit runs every time _get_collection opens a cache).
+            raw = client.get_or_create_collection(
+                _config.collection_name,
+                metadata={"hnsw:space": "cosine", "hnsw:num_threads": 1},
             )
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            _collection_cache = ChromaCollection(client.get_collection(_config.collection_name))
+            raw = client.get_collection(_config.collection_name)
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         return _collection_cache
@@ -285,7 +295,7 @@ def _get_cached_metadata(col, where=None):
 
 def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     """Validate optional wing/room-style filters."""
-    if value is None:
+    if value is None or not value.strip():
         return None
     return sanitize_name(value, field_name)
 
@@ -918,10 +928,10 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
+def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
     """
-    Write a diary entry for this agent. Each agent gets its own wing
-    with a diary room. Entries are timestamped and accumulate over time.
+    Write a diary entry for this agent. Entries are timestamped and
+    accumulate over time in a diary room.
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
@@ -932,7 +942,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    if wing:
+        wing = sanitize_name(wing)
+    else:
+        wing = f"wing_{agent_name.lower().replace(' ', '_')}"
     room = "diary"
     col = _get_collection(create=True)
     if not col:
@@ -987,24 +1000,38 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
         return {"success": False, "error": str(e)}
 
 
-def tool_diary_read(agent_name: str, last_n: int = 10):
+def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     """
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
+
+    When ``wing`` is provided, reads only from that wing. When ``wing``
+    is empty or omitted, returns entries from every wing this agent has
+    written to. Diary writes from hooks land in project-derived wings
+    (``wing_<project>``), so requiring a specific wing on read would
+    silo those entries from agent-initiated reads.
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
+        if wing:
+            wing = sanitize_name(wing)
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
     col = _get_collection()
     if not col:
         return _no_palace()
 
+    # Build filter: always scope by agent + room=diary. Wing is optional —
+    # when empty, return entries across all wings for this agent (matches
+    # the #1097 empty-string-as-no-filter convention for LLM ergonomics).
+    conditions = [{"room": "diary"}, {"agent": agent_name}]
+    if wing:
+        conditions.insert(0, {"wing": wing})
+
     try:
         results = col.get(
-            where={"$and": [{"wing": wing}, {"room": "diary"}]},
+            where={"$and": conditions},
             include=["documents", "metadatas"],
             limit=10000,
         )
@@ -1497,6 +1524,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Topic tag (optional, default: general)",
                 },
+                "wing": {
+                    "type": "string",
+                    "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
+                },
             },
             "required": ["agent_name", "entry"],
         },
@@ -1514,6 +1545,10 @@ TOOLS = {
                 "last_n": {
                     "type": "integer",
                     "description": "Number of recent entries to read (default: 10)",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Wing to read diary entries from (optional). If omitted, reads from wing_{agent_name}.",
                 },
             },
             "required": ["agent_name"],
