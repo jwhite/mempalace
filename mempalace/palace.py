@@ -562,3 +562,67 @@ def file_already_mined(collection, source_file: str, check_mtime: bool = False) 
         return True
     except Exception:
         return False
+
+
+def bulk_check_mined(collection) -> dict[str, float]:
+    """Pre-fetch source_file/source_mtime pairs for all documents in the collection.
+
+    Returns a dict mapping source_file -> source_mtime (as float) for every
+    document that has both fields.  Callers can check membership and compare
+    mtimes locally instead of issuing one ChromaDB query per file.
+
+    Fetches the full collection in paginated batches (like palace_graph.py)
+    since a WHERE-IN filter on thousands of paths is not supported by ChromaDB.
+    """
+    mined: dict[str, float] = {}
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                src = meta.get("source_file")
+                mtime = meta.get("source_mtime")
+                if src and mtime is not None:
+                    mined[src] = float(mtime)
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("bulk_check_mined: partial fetch, %d files loaded", len(mined))
+    return mined
+
+
+def prefetch_mined_set(collection) -> set[str]:
+    """Pre-fetch the set of source_files already mined at the current NORMALIZE_VERSION.
+
+    Mirrors file_already_mined()'s version-gate semantics (check_mtime=False
+    branch) but in one bulk pass instead of one ChromaDB query per file.
+    Returns a set of source_file paths whose stored drawers are at or above
+    NORMALIZE_VERSION; callers do `if path in result_set: skip`.
+
+    The convo miner walks thousands of transcript files; per-file
+    `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
+    palace, making a 2000-file sweep take >1h of pure skip-checking. This
+    helper drops that to a single paginated scan plus O(1) lookups.
+    """
+    mined: set[str] = set()
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                src = meta.get("source_file")
+                if not src:
+                    continue
+                # Same default as file_already_mined: missing version == 1
+                version = meta.get("normalize_version", 1)
+                if version >= NORMALIZE_VERSION:
+                    mined.add(src)
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
+    return mined

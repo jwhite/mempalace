@@ -414,6 +414,76 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="JWT", room="../backend")
         assert "error" in result
 
+    def test_search_retries_once_on_hnsw_flush_transient(self, monkeypatch, config, kg):
+        """Issue #1315: post-bulk-mine 'Error finding id' is retried once."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+        reset_calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        def fake_reset():
+            reset_calls["n"] += 1
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", fake_reset)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert reset_calls["n"] == 1
+        assert "results" in result
+        assert result.get("index_recovered") is True
+
+    def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
+        """Validation / unrelated errors must not trigger the retry path."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: invalid query syntax"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 1
+        assert "error" in result
+        assert "index_recovered" not in result
+
+    def test_search_returns_second_error_if_retry_also_fails(self, monkeypatch, config, kg):
+        """If the transient persists past the retry, surface the second error."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: Error executing plan: Internal error: Error finding id"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert "error" in result
+        assert "index_recovered" not in result
+
     def test_list_drawers_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -595,6 +665,25 @@ class TestWriteTools:
             threshold=0.99,
         )
         assert result["is_duplicate"] is False
+
+    def test_check_duplicate_short_circuits_when_vector_disabled(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "hnsw_capacity_status",
+            lambda *_args, **_kwargs: {"diverged": True, "message": "capacity mismatch"},
+        )
+
+        def fail_get_collection():
+            raise AssertionError("_get_collection must not run when vector search is disabled")
+
+        monkeypatch.setattr(mcp_server, "_get_collection", fail_get_collection)
+        result = mcp_server.tool_check_duplicate("content")
+
+        assert result["is_duplicate"] is False
+        assert result["vector_disabled"] is True
+        assert result["vector_disabled_reason"] == "capacity mismatch"
 
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -922,6 +1011,195 @@ class TestKGTools:
         # Full ISO-8601 dates still pass.
         result = tool_kg_query(entity="Max", as_of="2026-03-15")
         assert "error" not in result, f"rejected valid date: {result}"
+
+    def test_kg_add_accepts_datetime_valid_from(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_from"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_accepts_datetime_valid_to(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "worked_at",
+            "OldCo",
+            valid_from="2026-05-06T14:00:00Z",
+            valid_to="2026-05-06T15:00:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "worked_at" and r["object"] == "OldCo")
+
+        assert fact["valid_from"] == "2026-05-06T14:00:00Z"
+        assert fact["valid_to"] == "2026-05-06T15:00:00Z"
+
+    def test_kg_query_accepts_datetime_as_of(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_query(
+            "Alice",
+            as_of="2026-05-06T14:23:00Z",
+            direction="outgoing",
+        )
+
+        assert "error" not in result
+        assert result["as_of"] == "2026-05-06T14:23:00Z"
+        assert result["count"] == 1
+        assert result["facts"][0]["object"] == "Acme"
+
+    def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_invalidate(
+            "Alice",
+            "works_at",
+            "Acme",
+            ended="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+        assert result["ended"] == "2026-05-06T14:23:00Z"
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_to"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_rejects_non_canonical_datetimes(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_add(
+                "Alice",
+                "works_at",
+                "Acme",
+                valid_from=value,
+            )
+
+            assert result["success"] is False, value
+            assert "valid_from" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_query_rejects_non_canonical_datetime_as_of(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_query(
+                "Alice",
+                as_of=value,
+                direction="outgoing",
+            )
+
+            assert "error" in result, value
+            assert "as_of" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_invalidate_rejects_non_canonical_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_invalidate(
+                "Alice",
+                "works_at",
+                "Acme",
+                ended=value,
+            )
+
+            assert result["success"] is False, value
+            assert "ended" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_add_rejects_timezone_offset_datetime(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00+02:00",
+        )
+
+        assert result["success"] is False
+        assert "valid_from" in result["error"]
+        assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
@@ -1590,3 +1868,144 @@ class TestKGLazyCache:
         with pytest.raises(_sqlite3.ProgrammingError):
             mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
         assert calls["count"] == 2, "expected exactly one retry beyond the initial attempt"
+
+
+# ── Param-shape diagnostics on tools/call dispatch (#1351) ──────────────
+
+
+class TestParamShapeDiagnostics:
+    """Dispatch-level TypeError on tools/call should surface as JSON-RPC
+    -32602 (Invalid params) with the offending parameter named, instead of
+    the opaque -32000 Internal tool error. Handler-internal TypeError and
+    non-TypeError exceptions stay generic -32000 (no internals leak).
+    """
+
+    def test_missing_required_returns_32602_with_param_name(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {
+                    "name": "mempalace_diary_write",
+                    "arguments": {"agent_name": "test"},
+                },
+            }
+        )
+        assert resp["error"]["code"] == -32602
+        assert "'entry'" in resp["error"]["message"]
+        assert "mempalace_diary_write" in resp["error"]["message"]
+
+    def test_handler_internal_typeerror_stays_generic_32000(self, monkeypatch):
+        from mempalace import mcp_server
+
+        def boom(**_kw):
+            raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_status"], "handler", boom)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {"name": "mempalace_status", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32000
+        assert resp["error"]["message"] == "Internal tool error"
+        assert "unsupported operand" not in resp["error"]["message"]
+
+    def test_chromadb_exception_stays_generic_32000(self, monkeypatch):
+        from mempalace import mcp_server
+
+        def boom(**_kw):
+            raise RuntimeError("db schema mismatch at /private/path/chroma.sqlite3")
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_status"], "handler", boom)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 3,
+                "params": {"name": "mempalace_status", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32000
+        assert resp["error"]["message"] == "Internal tool error"
+        assert "db schema" not in resp["error"]["message"]
+        assert "/private/path" not in resp["error"]["message"]
+
+    def test_two_missing_required_lists_both_names(self):
+        """For 2+ missing args Python emits 'a' and 'b'; the response should
+        list both quoted names, not return a syntactically broken string.
+        """
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 4,
+                "params": {"name": "mempalace_diary_write", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32602
+        message = resp["error"]["message"]
+        assert "parameters" in message
+        assert "'agent_name'" in message
+        assert "'entry'" in message
+        assert " and " not in message.split("for tool")[0]
+
+    def test_handler_internal_signature_shape_stays_generic(self, monkeypatch):
+        """A TypeError whose function name does not match the dispatched
+        handler — e.g. raised by a helper called inside the handler body —
+        must fall through to generic -32000, otherwise we'd leak internal
+        helper/parameter names as if they were public tool parameters.
+        """
+        from mempalace import mcp_server
+
+        def calling_handler(**_kw):
+            def helper(req):
+                return req
+
+            helper()
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_status"], "handler", calling_handler)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 5,
+                "params": {"name": "mempalace_status", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32000
+        assert resp["error"]["message"] == "Internal tool error"
+        assert "'req'" not in resp["error"]["message"]
+        assert "helper" not in resp["error"]["message"]
+
+    def test_unexpected_kw_typeerror_inside_handler_stays_generic(self, monkeypatch):
+        """The 'got an unexpected keyword argument' shape is unreachable from
+        real dispatch (schema-filter on line 2236 drops unknown kwargs for
+        normal handlers; **kwargs handlers per #684 accept anything). If a
+        handler raises that shape manually, the qualname mismatch must keep
+        it on the generic -32000 path so internal helper names cannot leak.
+        """
+        from mempalace import mcp_server
+
+        def boom(**_kw):
+            raise TypeError("some_helper() got an unexpected keyword argument 'foo'")
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_status"], "handler", boom)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 6,
+                "params": {"name": "mempalace_status", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32000
+        assert resp["error"]["message"] == "Internal tool error"
+        assert "'foo'" not in resp["error"]["message"]
+        assert "some_helper" not in resp["error"]["message"]

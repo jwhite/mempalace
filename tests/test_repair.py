@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -73,6 +74,94 @@ def test_paginate_ids_offset_exception_fallback():
     ]
     ids = repair._paginate_ids(col)
     assert "id1" in ids
+
+
+# ── _extract_drawers ──────────────────────────────────────────────────
+
+
+def test_extract_drawers_preserves_valid_metadata():
+    """Non-empty dict metadata passes through unchanged."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}],
+    }
+    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=2, batch_size=2)
+    assert all_ids == ["id1", "id2"]
+    assert all_docs == ["doc1", "doc2"]
+    assert all_metas == [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}]
+
+
+def test_extract_drawers_sanitizes_none_metadata():
+    """None entries in metadatas are coerced to the sentinel dict.
+
+    chromadb 1.5.x's `validate_metadata` raises `ValueError: Expected metadata
+    to be a non-empty dict, got 0 metadata attributes in add.` if it sees a
+    None entry; the sanitizer keeps the rebuild upsert from crashing.
+    """
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2", "id3"],
+        "documents": ["doc1", "doc2", "doc3"],
+        "metadatas": [{"wing": "a"}, None, {"wing": "c"}],
+    }
+    _, _, all_metas = repair._extract_drawers(col, total=3, batch_size=3)
+    assert all_metas[0] == {"wing": "a"}
+    assert all_metas[1] == {"_repaired_empty_meta": True}
+    assert all_metas[2] == {"wing": "c"}
+
+
+def test_extract_drawers_sanitizes_empty_dict_metadata():
+    """Empty dict {} entries are coerced to the sentinel dict.
+
+    chromadb 1.5.x rejects `{}` the same way it rejects `None`. The comment
+    in the previous code path mistakenly assumed otherwise.
+    """
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{}, {"wing": "b"}],
+    }
+    _, _, all_metas = repair._extract_drawers(col, total=2, batch_size=2)
+    assert all_metas[0] == {"_repaired_empty_meta": True}
+    assert all_metas[1] == {"wing": "b"}
+
+
+def test_extract_drawers_sanitization_preserves_alignment():
+    """Sanitized output keeps the same length and ordering as input.
+
+    Critical invariant: ids[i] / documents[i] / metadatas[i] must stay in
+    lockstep through the sanitizer; otherwise the rebuild upsert mis-pairs
+    documents with metadata.
+    """
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2", "id3", "id4"],
+        "documents": ["d1", "d2", "d3", "d4"],
+        "metadatas": [None, {"k": "v"}, {}, None],
+    }
+    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=4, batch_size=4)
+    assert len(all_ids) == len(all_docs) == len(all_metas) == 4
+    assert all_ids == ["id1", "id2", "id3", "id4"]
+    assert all_metas[0] == {"_repaired_empty_meta": True}
+    assert all_metas[1] == {"k": "v"}
+    assert all_metas[2] == {"_repaired_empty_meta": True}
+    assert all_metas[3] == {"_repaired_empty_meta": True}
+
+
+def test_extract_drawers_multiple_batches():
+    """Pagination handles batch boundaries without losing/duplicating rows."""
+    col = MagicMock()
+    col.get.side_effect = [
+        {"ids": ["id1", "id2"], "documents": ["d1", "d2"], "metadatas": [{"a": 1}, None]},
+        {"ids": ["id3"], "documents": ["d3"], "metadatas": [{}]},
+        {"ids": [], "documents": [], "metadatas": []},
+    ]
+    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=3, batch_size=2)
+    assert all_ids == ["id1", "id2", "id3"]
+    assert all_metas == [{"a": 1}, {"_repaired_empty_meta": True}, {"_repaired_empty_meta": True}]
 
 
 # ── scan_palace ───────────────────────────────────────────────────────
@@ -809,63 +898,62 @@ def _seed_poisoned_max_seq_id(
     closets_vec = "seg-closets-vec-0000-1111-2222-333344445555"
     closets_meta = "seg-closets-meta-0000-1111-2222-33334444555"
 
-    conn = sqlite3.connect(db_path)
-    conn.executescript(
-        """
-        CREATE TABLE segments(
-            id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT
-        );
-        CREATE TABLE max_seq_id(segment_id TEXT PRIMARY KEY, seq_id);
-        CREATE TABLE embeddings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            segment_id TEXT,
-            embedding_id TEXT,
-            seq_id
-        );
-        CREATE TABLE embeddings_queue(seq_id INTEGER PRIMARY KEY, topic TEXT, id TEXT);
-        CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
-        """
-    )
-    conn.executemany(
-        "INSERT INTO segments VALUES (?, ?, ?, ?)",
-        [
-            (drawers_vec, "urn:vector", "VECTOR", drawers_coll),
-            (drawers_meta, "urn:metadata", "METADATA", drawers_coll),
-            (closets_vec, "urn:vector", "VECTOR", closets_coll),
-            (closets_meta, "urn:metadata", "METADATA", closets_coll),
-        ],
-    )
-    conn.executemany(
-        "INSERT INTO max_seq_id(segment_id, seq_id) VALUES (?, ?)",
-        [
-            (drawers_vec, drawers_vec_poison),
-            (drawers_meta, drawers_meta_poison),
-            (closets_vec, closets_vec_poison),
-            (closets_meta, closets_meta_poison),
-        ],
-    )
-    # Populate embeddings so the collection-MAX heuristic has data to work with.
-    # drawers METADATA owns the max at drawers_meta_max; closets likewise.
-    for i in range(1, drawers_meta_max + 1, max(drawers_meta_max // 5, 1)):
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE segments(
+                id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT
+            );
+            CREATE TABLE max_seq_id(segment_id TEXT PRIMARY KEY, seq_id);
+            CREATE TABLE embeddings(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment_id TEXT,
+                embedding_id TEXT,
+                seq_id
+            );
+            CREATE TABLE embeddings_queue(seq_id INTEGER PRIMARY KEY, topic TEXT, id TEXT);
+            CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO segments VALUES (?, ?, ?, ?)",
+            [
+                (drawers_vec, "urn:vector", "VECTOR", drawers_coll),
+                (drawers_meta, "urn:metadata", "METADATA", drawers_coll),
+                (closets_vec, "urn:vector", "VECTOR", closets_coll),
+                (closets_meta, "urn:metadata", "METADATA", closets_coll),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO max_seq_id(segment_id, seq_id) VALUES (?, ?)",
+            [
+                (drawers_vec, drawers_vec_poison),
+                (drawers_meta, drawers_meta_poison),
+                (closets_vec, closets_vec_poison),
+                (closets_meta, closets_meta_poison),
+            ],
+        )
+        # Populate embeddings so the collection-MAX heuristic has data to work with.
+        # drawers METADATA owns the max at drawers_meta_max; closets likewise.
+        for i in range(1, drawers_meta_max + 1, max(drawers_meta_max // 5, 1)):
+            conn.execute(
+                "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
+                (drawers_meta, f"d-{i}", i),
+            )
         conn.execute(
             "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-            (drawers_meta, f"d-{i}", i),
+            (drawers_meta, "d-max", drawers_meta_max),
         )
-    conn.execute(
-        "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-        (drawers_meta, "d-max", drawers_meta_max),
-    )
-    for i in range(1, closets_meta_max + 1, max(closets_meta_max // 5, 1)):
+        for i in range(1, closets_meta_max + 1, max(closets_meta_max // 5, 1)):
+            conn.execute(
+                "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
+                (closets_meta, f"c-{i}", i),
+            )
         conn.execute(
             "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-            (closets_meta, f"c-{i}", i),
+            (closets_meta, "c-max", closets_meta_max),
         )
-    conn.execute(
-        "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-        (closets_meta, "c-max", closets_meta_max),
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
     return {
         "drawers_vec": drawers_vec,
         "drawers_meta": drawers_meta,

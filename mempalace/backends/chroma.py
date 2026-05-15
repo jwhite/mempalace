@@ -70,8 +70,34 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
     return link_size / data_size
 
 
+def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
+    """Return False when a non-trivial HNSW payload lacks usable link lists.
+
+    A missing or empty link_lists.bin is acceptable only for a fresh/empty
+    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
+    is not a harmless async-flush shape: ChromaDB can later hand the broken
+    graph to hnswlib and crash in native code.
+    """
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    link_path = os.path.join(seg_dir, "link_lists.bin")
+
+    try:
+        if not os.path.isfile(data_path):
+            return True
+
+        data_size = os.path.getsize(data_path)
+        if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
+            return True
+
+        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+    except OSError:
+        return False
+
+
 def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     """Return False when HNSW payload files are structurally implausible."""
+    if not _hnsw_link_lists_is_usable_for_payload(seg_dir):
+        return False
 
     ratio = _hnsw_link_to_data_ratio(seg_dir)
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
@@ -873,10 +899,30 @@ class ChromaCollection(BaseCollection):
     # Writes
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_metadatas_for_chromadb(metadatas):
+        """chromadb 1.5.x rejects None and empty-dict entries in the metadatas
+        list (ValueError: Expected metadata to be a non-empty dict, got 0
+        metadata attributes in add). Coerce any such entry to a sentinel so
+        the write succeeds. Operators can later locate coerced drawers via
+        ``where={"_repaired_empty_meta": True}``.
+
+        This is the chokepoint catch-all: even if a caller's own sanitizer
+        misses a case (or skips for performance), reaching the chromadb
+        client always goes through here first.
+        """
+        if metadatas is None:
+            return None
+        return [
+            m if (isinstance(m, dict) and len(m) > 0) else {"_repaired_empty_meta": True}
+            for m in metadatas
+        ]
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
-        if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+        sanitized = self._sanitize_metadatas_for_chromadb(metadatas)
+        if sanitized is not None:
+            kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
@@ -884,8 +930,9 @@ class ChromaCollection(BaseCollection):
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
-        if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+        sanitized = self._sanitize_metadatas_for_chromadb(metadatas)
+        if sanitized is not None:
+            kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
